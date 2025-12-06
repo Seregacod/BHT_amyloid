@@ -11,14 +11,105 @@ Usage: python mutagenesis.py <input_file> [options]
 """
 
 import argparse
+import re
 import sys
-from typing import List, Tuple, Dict, Set, Any
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Set, Any, Union, Optional
 
-# Default mutation list - can be customized
+# Defining constants
+VALID_AAS = set('ACDEFGHIKLMNPQRSTVWY')
+FASTA_LINE_LENGTH = 60
+MAX_GAP_FOR_MERGING = 2
+
+# Default mutation list - customizable here
 DEFAULT_MUTATIONS = ['P', 'G', 'D', 'K']
 
 # Gatekeeping amino acids (only applied to edge positions)
 GATEKEEPING_AAS = ['Y']
+
+# Data classes for cluster structures
+@dataclass
+class Cluster:
+    """Represents a cluster of amino acid positions matching a rule"""
+    positions: List[int]
+    residues: List[str]
+    rule_name: str
+    aggregation_score: int
+    size: int = field(init=False)
+    span: int = field(init=False)
+    
+    def __post_init__(self):
+        """Calculate size and span after initialization"""
+        self.size = len(self.positions)
+        if self.positions:
+            self.span = max(self.positions) - min(self.positions) + 1
+        else:
+            self.span = 0
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for backward compatibility"""
+        return {
+            'positions': self.positions,
+            'residues': self.residues,
+            'size': self.size,
+            'span': self.span,
+            'rule_name': self.rule_name,
+            'aggregation_score': self.aggregation_score
+        }
+
+@dataclass
+class HydrophobicAromaticCluster(Cluster):
+    """Special cluster for hydrophobic-aromatic interactions"""
+    pair_count: int = 0
+    condition: str = ""
+    hydrophobic_count: int = 0
+    aromatic_count: int = 0
+    pairs: List[Dict] = field(default_factory=list)
+    nearby_hydrophobics: List[Dict] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary with special fields"""
+        result = super().to_dict()
+        result.update({
+            'pair_count': self.pair_count,
+            'condition': self.condition,
+            'hydrophobic_count': self.hydrophobic_count,
+            'aromatic_count': self.aromatic_count,
+            'pairs': self.pairs,
+            'nearby_hydrophobics': self.nearby_hydrophobics
+        })
+        return result
+
+@dataclass
+class MultiRuleCluster:
+    """Represents a cluster matching multiple rules"""
+    positions: List[int]
+    residues: List[str]
+    rules: List[str]
+    combined_aggregation_score: int
+    size: int = field(init=False)
+    span: int = field(init=False)
+    is_multi_rule: bool = True
+    
+    def __post_init__(self):
+        """Calculate size and span after initialization"""
+        self.size = len(self.positions)
+        if self.positions:
+            self.span = max(self.positions) - min(self.positions) + 1
+        else:
+            self.span = 0
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for backward compatibility"""
+        return {
+            'positions': self.positions,
+            'residues': self.residues,
+            'size': self.size,
+            'span': self.span,
+            'rules': self.rules,
+            'combined_aggregation_score': self.combined_aggregation_score,
+            'is_multi_rule': self.is_multi_rule
+        }
 
 # Define rules for mutagenesis with clustering requirement
 RULES = {
@@ -26,10 +117,10 @@ RULES = {
         'description': 'V, I, L, A, M present and clustered (≥3 residues within 4 positions)',
         'residues': {'V', 'I', 'L', 'A', 'M'},
         'min_cluster_size': 3,
-        'max_gap': 4,  # Changed from 3 to 4 as requested
+        'max_gap': 4,
         'mutations': DEFAULT_MUTATIONS,
         'priority': 1,
-        'aggregation_score': 3  # Changed from 2 to 3 (highest)
+        'aggregation_score': 3
     },
     'aromatic': {
         'description': 'F, Y, W present and clustered (any combination within 3 positions)',
@@ -38,7 +129,7 @@ RULES = {
         'max_gap': 3,
         'mutations': DEFAULT_MUTATIONS,
         'priority': 2,
-        'aggregation_score': 2  # Changed from 3 to 2
+        'aggregation_score': 2
     },
     'amide': {
         'description': 'Q, N present and clustered (any combination within 3 positions)',
@@ -47,16 +138,16 @@ RULES = {
         'max_gap': 3,
         'mutations': DEFAULT_MUTATIONS,
         'priority': 3,
-        'aggregation_score': 1  # Lowest score
+        'aggregation_score': 1
     },
     'hydrophobic_and_aromatic': {
         'description': 'Hydrophobic (V,I,L,A,M) adjacent to aromatic (F,Y,W) (≥2 such pairs OR 1 pair + hydrophobic)',
         'residues': {'V', 'I', 'L', 'A', 'M', 'F', 'Y', 'W'},
-        'min_cluster_size': 2,  # At least 2 interactions
+        'min_cluster_size': 2,
         'max_gap': 1,
         'mutations': DEFAULT_MUTATIONS,
         'priority': 4,
-        'aggregation_score': 2,  # Changed from 4 to 2 as requested
+        'aggregation_score': 2,
         'special_rule': True
     }
 }
@@ -111,7 +202,7 @@ GATEKEEPING AMINO ACIDS:
 
 REQUIRED PARAMETERS:
 =========================================================
-• input_file    : Input FASTA file containing protein sequence
+• input_file    : Input FASTA file containing protein sequence (the multifasta format is not supported!)
 • Either --positions OR --regions must be specified
 """
     print(example)
@@ -149,11 +240,46 @@ def read_fasta(filepath: str) -> Tuple[str, str]:
     except Exception as e:
         raise ValueError(f"Error reading FASTA file: {e}")
 
+def validate_amino_acids(input_data: Union[str, List[str]], name: str = "amino acids", strict: bool = False) -> bool:
+    """
+    Unified function to validate amino acid codes.
+    
+    Args:
+        input_data: Can be a string (sequence) or list of strings (amino acid codes)
+        name: Description for error messages (used only in strict mode)
+        strict: If True, raises ValueError on invalid input. If False, returns bool.
+    
+    Returns:
+        bool: True if all amino acids are valid (only when strict=False)
+    
+    Raises:
+        ValueError: If strict=True and invalid amino acids are found
+    """
+    if isinstance(input_data, str):
+        # Validate sequence string: check if all characters are valid AAs
+        invalid_chars = [char for char in set(input_data.upper()) if char not in VALID_AAS]
+        if invalid_chars:
+            if strict:
+                raise ValueError(f"Invalid {name}: contains invalid characters {invalid_chars}. "
+                               f"Valid amino acids: {', '.join(sorted(VALID_AAS))}")
+            return False
+        return True
+    
+    elif isinstance(input_data, list):
+        # Validate list of amino acid codes: check if all items are single valid AAs
+        invalid = [aa for aa in input_data if len(aa) != 1 or aa.upper() not in VALID_AAS]
+        if invalid:
+            if strict:
+                raise ValueError(f"Invalid {name}: {invalid}. Valid amino acids: {', '.join(sorted(VALID_AAS))}")
+            return False
+        return True
+    
+    else:
+        raise TypeError(f"input_data must be str or list, got {type(input_data).__name__}")
+
 def validate_sequence(sequence: str) -> bool:
-    """Validate that the sequence contains only valid amino acid codes"""
-    valid_aas = set('ACDEFGHIKLMNPQRSTVWY')
-    sequence_set = set(sequence.upper())
-    return sequence_set.issubset(valid_aas)
+    """Validate that the sequence contains only valid amino acid codes (non-strict)"""
+    return validate_amino_acids(sequence, "sequence", strict=False)
 
 def parse_region(region_str: str, seq_length: int) -> Tuple[int, int]:
     """Parse region string in format start:stop (1-indexed)"""
@@ -422,20 +548,22 @@ def analyze_region(sequence: str, start: int, stop: int) -> Dict:
         
         # Add qualifying clusters for this rule
         for cluster in hydrophobic_aromatic_clusters:
-            results['rules']['hydrophobic_and_aromatic']['qualifying_clusters'].append({
+            # Create a proper cluster dictionary with all required fields
+            qual_cluster = {
                 'positions': cluster['positions'],
                 'residues': cluster['residues'],
                 'size': cluster['size'],
                 'span': cluster['span'],
                 'rule_name': 'hydrophobic_and_aromatic',
                 'aggregation_score': RULES['hydrophobic_and_aromatic']['aggregation_score'],
-                'pair_count': cluster['pair_count'],
-                'condition': cluster['condition'],
-                'hydrophobic_count': cluster['hydrophobic_count'],
-                'aromatic_count': cluster['aromatic_count'],
+                'pair_count': cluster.get('pair_count', 0),
+                'condition': cluster.get('condition', ''),
+                'hydrophobic_count': cluster.get('hydrophobic_count', 0),
+                'aromatic_count': cluster.get('aromatic_count', 0),
                 'pairs': cluster.get('pairs', []),
                 'nearby_hydrophobics': cluster.get('nearby_hydrophobics', [])
-            })
+            }
+            results['rules']['hydrophobic_and_aromatic']['qualifying_clusters'].append(qual_cluster)
     else:
         results['rules']['hydrophobic_and_aromatic'] = {
             'description': RULES['hydrophobic_and_aromatic']['description'],
@@ -452,48 +580,147 @@ def analyze_region(sequence: str, start: int, stop: int) -> Dict:
             'special_clusters': []
         }
     
-    # Now identify clusters that match multiple rules
+    # Now identify clusters that match multiple rules (optimized O(n log n))
     all_clusters = []
     for rule_name, rule_data in results['rules'].items():
         for cluster in rule_data['qualifying_clusters']:
-            all_clusters.append((rule_name, cluster))
+            # Use the rule_name from the cluster
+            all_clusters.append((cluster['rule_name'], cluster))
     
-    # Find overlapping clusters (clusters with overlapping positions)
-    for i in range(len(all_clusters)):
-        rule1, cluster1 = all_clusters[i]
-        cluster1_positions = set(cluster1['positions'])
-        
-        for j in range(i + 1, len(all_clusters)):
-            rule2, cluster2 = all_clusters[j]
-            cluster2_positions = set(cluster2['positions'])
-            
-            # Check if clusters overlap
-            overlap = cluster1_positions.intersection(cluster2_positions)
-            if overlap:
-                all_positions = sorted(cluster1_positions.union(cluster2_positions))
-                combined_residues = [sequence[pos-1] for pos in all_positions]
-                
-                score1 = RULES[rule1]['aggregation_score']
-                score2 = RULES[rule2]['aggregation_score']
-                combined_score = score1 + score2 + 1
-                
-                multi_rule_cluster = {
-                    'positions': all_positions,
-                    'residues': combined_residues,
-                    'size': len(all_positions),
-                    'span': max(all_positions) - min(all_positions) + 1,
-                    'rules': [rule1, rule2],
-                    'combined_aggregation_score': combined_score,
-                    'is_multi_rule': True
-                }
-                
-                results['multi_rule_clusters'].append(multi_rule_cluster)
-                results['aggregation_hotspots'].extend(all_positions)
+    # Use optimized overlap detection
+    if all_clusters:
+        merged_multi_clusters = find_overlapping_clusters_optimized(all_clusters, sequence)
+        for merged_cluster in merged_multi_clusters:
+            if merged_cluster.get('is_multi_rule', False):
+                results['multi_rule_clusters'].append(merged_cluster)
+                results['aggregation_hotspots'].extend(merged_cluster['positions'])
     
     # Remove duplicates from aggregation hotspots
     results['aggregation_hotspots'] = sorted(set(results['aggregation_hotspots']))
     
     return results
+
+def find_overlapping_clusters_optimized(all_clusters: List[Tuple[str, Dict]], sequence: str) -> List[Dict]:
+    """
+    Optimized O(n log n) overlap detection using spatial sorting.
+    Returns list of multi-rule clusters.
+    """
+    if not all_clusters:
+        return []
+    
+    # Create cluster intervals with metadata (start, end, rule_name, cluster_data)
+    intervals = []
+    for rule_name, cluster_data in all_clusters:
+        positions = cluster_data.get('positions', [])
+        if positions:
+            # Clean and validate rule_name
+            if not rule_name or not isinstance(rule_name, str):
+                rule_name = 'unknown'
+            
+            intervals.append({
+                'start': min(positions),
+                'end': max(positions),
+                'rule_name': rule_name,
+                'cluster_data': cluster_data,
+                'positions_set': set(positions)
+            })
+    
+    if not intervals:
+        return []
+    
+    # Sort by start position (O(n log n))
+    intervals.sort(key=lambda x: x['start'])
+    
+    # Single pass merge (O(n))
+    merged_clusters = []
+    current_group = [intervals[0]]
+    
+    for interval in intervals[1:]:
+        # Check if current interval overlaps or is close to the last in current group
+        last_in_group = current_group[-1]
+        gap = interval['start'] - last_in_group['end'] - 1
+        
+        if interval['positions_set'].intersection(last_in_group['positions_set']) or gap <= MAX_GAP_FOR_MERGING:
+            # Merge into current group
+            current_group.append(interval)
+        else:
+            # Finalize current group and start new one
+            if len(current_group) > 1:
+                merged_clusters.append(_merge_cluster_group(current_group, sequence))
+            current_group = [interval]
+    
+    # Don't forget the last group
+    if len(current_group) > 1:
+        merged_clusters.append(_merge_cluster_group(current_group, sequence))
+    
+    return merged_clusters
+
+def _merge_cluster_group(group: List[Dict], sequence: str) -> Dict:
+    """Merge a group of overlapping clusters into a single cluster"""
+    all_positions = set()
+    all_rule_names = set()  # Use set to collect all individual rule names
+    max_score = 0
+    total_score = 0
+    
+    for item in group:
+        all_positions.update(item['positions_set'])
+        # Handle merged rule names - split by '+' to get individual rules
+        rule_name = item.get('rule_name', '')
+        if not rule_name:
+            rule_name = 'unknown'
+        
+        # Filter out any empty strings AND only keep valid rule names
+        individual_rules = []
+        for r in rule_name.split('+'):
+            r = r.strip()
+            if r and r in RULES:
+                individual_rules.append(r)
+        
+        all_rule_names.update(individual_rules)
+        score = item['cluster_data'].get('aggregation_score', 0)
+        max_score = max(max_score, score)
+        total_score += score
+    
+    sorted_positions = sorted(all_positions)
+    combined_residues = [sequence[pos-1] for pos in sorted_positions]
+    
+    # Get unique rules (already unique since we used a set)
+    unique_rules = sorted(list(all_rule_names))
+    
+    # If no valid rules found, check if we have any non-standard rule names
+    if not unique_rules:
+        # Try to extract any rule-like names that might have been created
+        for item in group:
+            rule_name = item.get('rule_name', '')
+            # Look for patterns like rule names in the string
+            for possible_rule in RULES.keys():
+                if possible_rule in rule_name:
+                    unique_rules.append(possible_rule)
+        
+        # Remove duplicates again
+        unique_rules = sorted(list(set(unique_rules)))
+    
+    # If still no rules, use a placeholder but ensure it's valid for downstream processing
+    if not unique_rules:
+        # Use the first valid rule as a fallback
+        unique_rules = [list(RULES.keys())[0]]
+    
+    if len(unique_rules) > 1:
+        combined_score = total_score + len(unique_rules) - 1
+    else:
+        combined_score = max_score
+    
+    return {
+        'positions': sorted_positions,
+        'residues': combined_residues,
+        'size': len(sorted_positions),
+        'span': max(sorted_positions) - min(sorted_positions) + 1 if sorted_positions else 0,
+        'rules': unique_rules,
+        'combined_aggregation_score': combined_score,
+        'is_multi_rule': len(unique_rules) > 1,
+        'rule_name': '+'.join(unique_rules) if len(unique_rules) > 1 else unique_rules[0],
+        'aggregation_score': combined_score
+    }
 
 def resolve_overlapping_clusters(all_clusters: List[Tuple[str, Dict]], sequence: str) -> List[Tuple[str, Dict]]:
     """
@@ -507,8 +734,20 @@ def resolve_overlapping_clusters(all_clusters: List[Tuple[str, Dict]], sequence:
     # Extract clusters and their positions
     clusters = []
     for rule_name, cluster_data in all_clusters:
+        # Clean up rule_name before storing
+        # Filter out empty strings and non-valid rule names
+        valid_rules = [r for r in rule_name.split('+') if r and r in RULES]
+        if not valid_rules:
+            # If no valid rules, check if rule_name contains any valid rule
+            for possible_rule in RULES.keys():
+                if possible_rule in rule_name:
+                    valid_rules.append(possible_rule)
+        
+        # Create cleaned rule name
+        cleaned_rule_name = '+'.join(sorted(set(valid_rules))) if valid_rules else list(RULES.keys())[0]
+        
         clusters.append({
-            'rule_name': rule_name,
+            'rule_name': cleaned_rule_name,
             'positions': set(cluster_data['positions']),
             'data': cluster_data
         })
@@ -555,9 +794,28 @@ def resolve_overlapping_clusters(all_clusters: List[Tuple[str, Dict]], sequence:
                         base_data['size'] = len(merged_positions)
                         base_data['span'] = max(merged_positions) - min(merged_positions) + 1
                         
+                        # Get rule sets for comparison (filtering out empty strings and invalid rules)
+                        current_rules_set = set([r for r in current['rule_name'].split('+') if r and r in RULES])
+                        other_rules_set = set([r for r in other['rule_name'].split('+') if r and r in RULES])
+                        
                         # If merging different rules, create a multi-rule cluster
-                        if current['rule_name'] != other['rule_name']:
-                            base_data['rule_name'] = f"{current['rule_name']}+{other['rule_name']}"
+                        if current_rules_set != other_rules_set:
+                            # Merge the rules
+                            merged_rules = sorted(current_rules_set.union(other_rules_set))
+                            # Ensure we have at least one valid rule
+                            if not merged_rules:
+                                # Try to extract rules from original rule names
+                                for rule_str in [current['rule_name'], other['rule_name']]:
+                                    for possible_rule in RULES.keys():
+                                        if possible_rule in rule_str and possible_rule not in merged_rules:
+                                            merged_rules.append(possible_rule)
+                                merged_rules = sorted(list(set(merged_rules)))
+                            
+                            # If still no rules, use a default
+                            if not merged_rules:
+                                merged_rules = [list(RULES.keys())[0]]
+                                
+                            base_data['rule_name'] = '+'.join(merged_rules)
                             # Sum aggregation scores
                             score1 = current['data'].get('aggregation_score', 0)
                             score2 = other['data'].get('aggregation_score', 0)
@@ -603,6 +861,32 @@ def resolve_overlapping_clusters(all_clusters: List[Tuple[str, Dict]], sequence:
     
     return result
 
+def create_mutated_sequence(sequence: str, position: int, new_aa: str) -> str:
+    """
+    Efficiently create a mutated sequence by replacing one amino acid.
+    Optimized to avoid unnecessary list creation for large sequences.
+    """
+    if position < 1 or position > len(sequence):
+        raise ValueError(f"Position {position} out of range (1-{len(sequence)})")
+    
+    # For small sequences, list conversion is fine
+    # For large sequences, use slicing (more memory efficient)
+    if len(sequence) < 1000:
+        seq_list = list(sequence)
+        seq_list[position - 1] = new_aa
+        return ''.join(seq_list)
+    else:
+        # For large sequences, use string slicing (avoids full list creation)
+        return sequence[:position-1] + new_aa + sequence[position:]
+
+def get_mutations_for_position(pos: int, cluster_positions: List[int], 
+                               region_start: int, region_end: int,
+                               mutations: List[str], gatekeeping_aas: List[str]) -> List[str]:
+    """Get list of mutations to apply based on position type (edge vs internal)"""
+    if is_edge_position(pos, cluster_positions, region_start, region_end):
+        return list(set(mutations + gatekeeping_aas))
+    return mutations
+
 def is_edge_position(pos: int, cluster_positions: List[int], region_start: int, region_end: int) -> bool:
     """
     Check if a position is at the edge of a cluster or directly adjacent to it.
@@ -639,7 +923,7 @@ def is_edge_position(pos: int, cluster_positions: List[int], region_start: int, 
     return False
 
 def apply_rule_mutations(sequence: str, region_analysis: Dict, mutations: List[str], 
-                        selected_rules: List[str] = None, gatekeeping_aas: List[str] = None) -> List[Tuple[str, str]]:
+                        selected_rules: List[str] = None, gatekeeping_aas: List[str] = None) -> List[Tuple[str, str, int]]:
     """Apply mutations based on rules in analyzed region"""
     results = []
     
@@ -663,13 +947,21 @@ def apply_rule_mutations(sequence: str, region_analysis: Dict, mutations: List[s
         
         if rule_name == 'hydrophobic_and_aromatic' and 'special_clusters' in rule_data:
             for cluster in rule_data['special_clusters']:
-                all_clusters.append((rule_name, cluster))
+                # Ensure cluster has rule_name field
+                cluster_with_rule = cluster.copy()
+                cluster_with_rule['rule_name'] = rule_name
+                if 'aggregation_score' not in cluster_with_rule:
+                    cluster_with_rule['aggregation_score'] = rule_data['aggregation_score']
+                all_clusters.append((rule_name, cluster_with_rule))
         else:
             for cluster in rule_data['qualifying_clusters']:
-                all_clusters.append((rule_name, cluster))
+                all_clusters.append((cluster['rule_name'], cluster))
     
     # Resolve overlapping clusters (keep union of motifs)
     non_overlapping_clusters = resolve_overlapping_clusters(all_clusters, sequence)
+    
+    # Track mutated positions to avoid duplicates (performance optimization)
+    mutated_positions = set()
     
     # Apply mutations from non-overlapping clusters
     for rule_name, cluster in non_overlapping_clusters:
@@ -681,123 +973,95 @@ def apply_rule_mutations(sequence: str, region_analysis: Dict, mutations: List[s
             for mc in region_analysis['multi_rule_clusters']
         )
         
+        # Get aggregation score for this cluster
+        agg_score = cluster.get('aggregation_score') or cluster.get('combined_aggregation_score', 0)
+        
         # Apply each mutation to each position in the cluster
         for pos in positions_to_mutate:
             original_aa = sequence[pos-1]
             
             # Determine which mutations to apply based on edge status
-            if is_edge_position(pos, positions_to_mutate, region_start, region_end):
-                # Edge position: apply both regular mutations and gatekeeping mutations
-                all_mutations = list(set(mutations + gatekeeping_aas))
-            else:
-                # Internal position: apply only regular mutations
-                all_mutations = mutations
+            all_mutations = get_mutations_for_position(
+                pos, positions_to_mutate, region_start, region_end, 
+                mutations, gatekeeping_aas
+            )
             
             for new_aa in all_mutations:
                 if new_aa == original_aa:
                     continue
                 
-                mutated_seq = list(sequence)
-                mutated_seq[pos-1] = new_aa
+                # Track this position as mutated
+                mutated_positions.add(pos)
+                
+                mutated_seq = create_mutated_sequence(sequence, pos, new_aa)
                 
                 # Check if this is a gatekeeping mutation
                 is_gatekeeping = new_aa in gatekeeping_aas and new_aa not in mutations
                 
-                # Special handling for hydrophobic_and_aromatic
-                if rule_name == 'hydrophobic_and_aromatic':
-                    # Create description based on condition
-                    condition_info = ""
-                    if cluster['condition'] == 'at_least_2_pairs':
-                        pair_info = []
-                        for pair in cluster.get('pairs', []):
-                            pair_info.append(f"{pair['residues'][0]}{pair['positions'][0]}-{pair['residues'][1]}{pair['positions'][1]}")
-                        condition_info = f"({cluster['pair_count']} pairs: {', '.join(pair_info)})"
-                    else:  # 1_pair_plus_hydrophobic
-                        pair = cluster['pairs'][0] if cluster.get('pairs') else None
-                        hydrophobic_info = []
-                        for h in cluster.get('nearby_hydrophobics', []):
-                            hydrophobic_info.append(f"{h['residue']}{h['position']}")
-                        
-                        if pair:
-                            pair_str = f"{pair['residues'][0]}{pair['positions'][0]}-{pair['residues'][1]}{pair['positions'][1]}"
-                            condition_info = f"(1 pair {pair_str} + hydrophobics: {', '.join(hydrophobic_info)})"
-                        else:
-                            condition_info = f"(1 pair + hydrophobics: {', '.join(hydrophobic_info)})"
-                    
-                    description = (f"{original_aa}{pos}{new_aa} | Rule 'hydrophobic_and_aromatic' "
-                                 f"{condition_info}")
-                elif '+' in rule_name:  # Merged multi-rule cluster
-                    description = (f"{original_aa}{pos}{new_aa} | MERGED RULES "
-                                 f"{rule_name} "
-                                 f"(agg_score={cluster['aggregation_score']})")
+                # Build description based on rule type
+                if '+' in rule_name:  # Merged multi-rule cluster
+                    description = f"{original_aa}{pos}{new_aa} | MERGED RULES {rule_name} (agg_score={agg_score})"
                 elif is_part_of_multi:
+                    # Find the specific multi-rule cluster
                     for mc in region_analysis['multi_rule_clusters']:
                         if set(positions_to_mutate).issubset(set(mc['positions'])):
-                            description = (f"{original_aa}{pos}{new_aa} | MULTI-RULE "
-                                         f"{'+'.join(mc['rules'])} "
-                                         f"(agg_score={mc['combined_aggregation_score']})")
+                            description = f"{original_aa}{pos}{new_aa} | MERGED RULES {'+'.join(mc['rules'])} (agg_score={mc['combined_aggregation_score']})"
+                            agg_score = mc['combined_aggregation_score']  # Use the multi-rule score
                             break
+                    else:
+                        # Fallback if not found in multi-rule clusters
+                        description = f"{original_aa}{pos}{new_aa} | Rule '{rule_name}' (agg_score={agg_score})"
                 else:
-                    description = (f"{original_aa}{pos}{new_aa} | Rule '{rule_name}'")
+                    # Standard rule-based mutation
+                    description = f"{original_aa}{pos}{new_aa} | Rule '{rule_name}' (agg_score={agg_score})"
                 
                 # Add gatekeeping indicator if applicable
                 if is_gatekeeping:
                     description += f" | GATEKEEPING ({new_aa})"
                 
-                results.append((description, ''.join(mutated_seq)))
+                results.append((description, mutated_seq, agg_score))
     
     # Apply mutations from multi-rule clusters (ensure no overlap with single-rule clusters)
     for multi_cluster in region_analysis['multi_rule_clusters']:
         positions_to_mutate = multi_cluster['positions']
         
         # Check if any position in this multi-rule cluster has already been mutated
-        # by looking at existing results
-        already_mutated = False
-        for desc, mutated_seq in results:
-            # Extract position from description (format: "A10B | Rule...")
-            if "|" in desc:
-                pos_part = desc.split("|")[0].strip()
-                # Extract position number (e.g., "A10B" -> extract "10")
-                import re
-                match = re.search(r'(\d+)', pos_part)
-                if match:
-                    pos_num = int(match.group(1))
-                    if pos_num in positions_to_mutate:
-                        already_mutated = True
-                        break
+        # Use set intersection for efficient checking (O(1) average case)
+        if any(pos in mutated_positions for pos in positions_to_mutate):
+            continue  # Skip if already mutated
         
-        # Only apply mutations if positions haven't been mutated yet
-        if not already_mutated:
-            for pos in positions_to_mutate:
-                original_aa = sequence[pos-1]
+        # Track all positions that will be mutated
+        mutated_positions.update(positions_to_mutate)
+        
+        # Get aggregation score for this cluster
+        agg_score = multi_cluster.get('combined_aggregation_score', 0)
+        
+        for pos in positions_to_mutate:
+            original_aa = sequence[pos-1]
+            
+            # Determine which mutations to apply based on edge status
+            all_mutations = get_mutations_for_position(
+                pos, positions_to_mutate, region_start, region_end,
+                mutations, gatekeeping_aas
+            )
+            
+            for new_aa in all_mutations:
+                if new_aa == original_aa:
+                    continue
                 
-                # Determine which mutations to apply based on edge status
-                if is_edge_position(pos, positions_to_mutate, region_start, region_end):
-                    # Edge position: apply both regular mutations and gatekeeping mutations
-                    all_mutations = list(set(mutations + gatekeeping_aas))
-                else:
-                    # Internal position: apply only regular mutations
-                    all_mutations = mutations
+                mutated_seq = create_mutated_sequence(sequence, pos, new_aa)
                 
-                for new_aa in all_mutations:
-                    if new_aa == original_aa:
-                        continue
-                    
-                    mutated_seq = list(sequence)
-                    mutated_seq[pos-1] = new_aa
-                    
-                    # Check if this is a gatekeeping mutation
-                    is_gatekeeping = new_aa in gatekeeping_aas and new_aa not in mutations
-                    
-                    description = (f"{original_aa}{pos}{new_aa} | MULTI-RULE "
-                                 f"{'+'.join(multi_cluster['rules'])} "
-                                 f"(agg_score={multi_cluster['combined_aggregation_score']})")
-                    
-                    # Add gatekeeping indicator if applicable
-                    if is_gatekeeping:
-                        description += f" | GATEKEEPING ({new_aa})"
-                    
-                    results.append((description, ''.join(mutated_seq)))
+                # Check if this is a gatekeeping mutation
+                is_gatekeeping = new_aa in gatekeeping_aas and new_aa not in mutations
+                
+                # Create description for multi-rule mutation
+                description = f"{original_aa}{pos}{new_aa} | MERGED RULES {'+'.join(multi_cluster['rules'])} (agg_score={agg_score})"
+                
+                # Add gatekeeping indicator if applicable
+                if is_gatekeeping:
+                    description += f" | GATEKEEPING ({new_aa})"
+                
+                results.append((description, mutated_seq, agg_score))
     
     return results
 
@@ -806,7 +1070,7 @@ def mutate_sequence(sequence: str, positions: List[int], mutations: List[str],
                    insertion_positions: List[int] = None, insertion_aas: List[str] = None,
                    gatekeeping_aas: List[str] = None, verbose: bool = False) -> Tuple[List[Tuple[str, str]], List[Dict]]:
     """Generate mutated sequences with point mutations, rule-based mutations, and insertions"""
-    results = []
+    all_results = []  # Will store (description, sequence, agg_score)
     region_analyses = []
     seq_len = len(sequence)
     
@@ -901,7 +1165,7 @@ def mutate_sequence(sequence: str, positions: List[int], mutations: List[str],
     # Apply rule-based mutations
     for analysis in region_analyses:
         rule_mutations = apply_rule_mutations(sequence, analysis, mutations, selected_rules, gatekeeping_aas)
-        results.extend(rule_mutations)
+        all_results.extend(rule_mutations)
     
     # Generate direct point mutations
     for pos in positions:
@@ -912,11 +1176,11 @@ def mutate_sequence(sequence: str, positions: List[int], mutations: List[str],
             if new_aa == original_aa:
                 continue
             
-            mutated_seq = list(sequence)
-            mutated_seq[pos-1] = new_aa
+            mutated_seq = create_mutated_sequence(sequence, pos, new_aa)
             
-            description = f"{original_aa}{pos}{new_aa} | Direct mutation"
-            results.append((description, ''.join(mutated_seq)))
+            # Standardized description for direct mutations with agg_score=0
+            description = f"{original_aa}{pos}{new_aa} | Direct mutation (agg_score=0)"
+            all_results.append((description, mutated_seq, 0))
     
     # Generate insertions if specified
     if insertion_positions and insertion_aas:
@@ -928,10 +1192,17 @@ def mutate_sequence(sequence: str, positions: List[int], mutations: List[str],
                 raise ValueError(f"Insertion position {ins_pos} is out of range (1-{seq_len+1})")
             
             mutated_seq = sequence[:ins_pos-1] + ins_aa + sequence[ins_pos-1:]
-            description = f"Insertion: {ins_aa} inserted before position {ins_pos}"
-            results.append((description, mutated_seq))
+            # Standardized description for insertions with agg_score=0
+            description = f"Insertion: {ins_aa} inserted before position {ins_pos} (agg_score=0)"
+            all_results.append((description, mutated_seq, 0))
     
-    return results, region_analyses
+    # Sort all results by aggregation score (descending)
+    all_results.sort(key=lambda x: x[2], reverse=True)
+    
+    # Convert to format expected by downstream functions (description, sequence)
+    sorted_results = [(desc, seq) for desc, seq, _ in all_results]
+    
+    return sorted_results, region_analyses
 
 def write_fasta(output_file: str, original_header: str, original_seq: str, 
                 mutations: List[Tuple[str, str]], include_original: bool = True):
@@ -939,15 +1210,19 @@ def write_fasta(output_file: str, original_header: str, original_seq: str,
     with open(output_file, 'w') as f:
         if include_original:
             f.write(f"{original_header}\n")
-            for i in range(0, len(original_seq), 60):
-                f.write(f"{original_seq[i:i+60]}\n")
+            for i in range(0, len(original_seq), FASTA_LINE_LENGTH):
+                f.write(f"{original_seq[i:i+FASTA_LINE_LENGTH]}\n")
         
         for i, (description, mutated_seq) in enumerate(mutations, 1):
-            f.write(f">{original_header[1:].strip()}_{description}\n")
-            for j in range(0, len(mutated_seq), 60):
-                f.write(f"{mutated_seq[j:j+60]}\n")
+            # Extract protein name from original header (remove '>')
+            protein_name = original_header[1:].strip()
+            # Keep spaces in description for readability
+            f.write(f">{protein_name}_{description}\n")
+            for j in range(0, len(mutated_seq), FASTA_LINE_LENGTH):
+                f.write(f"{mutated_seq[j:j+FASTA_LINE_LENGTH]}\n")
 
-def main():
+def setup_argument_parser() -> argparse.ArgumentParser:
+    """Setup and return argument parser"""
     parser = argparse.ArgumentParser(
         description='Perform rule-based in silico mutagenesis on protein sequences',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1006,66 +1281,62 @@ def main():
     other_args.add_argument('-h', '--help', action='store_true',
                            help='Show this help message and exit')
     
-    args = parser.parse_args()
+    return parser
+
+def print_help_info(parser: argparse.ArgumentParser):
+    """Print detailed help information"""
+    print("=" * 70)
+    print("RULE-BASED IN SILICO MUTAGENESIS SCRIPT (WITH CLUSTERING)")
+    print("=" * 70)
+    print("\nDESCRIPTION:")
+    print("Performs rule-based mutagenesis on protein sequences.")
+    print("Rules apply ONLY when amino acids are clustered together.")
+    print("Multiple rules can apply simultaneously to the same motif.")
+    print("Motifs with multiple rule matches are flagged as aggregation hotspots.")
+    print("\n" + "=" * 70)
     
-    # Show help if requested or no input file provided
-    if args.help or not args.input_file:
-        print("=" * 70)
-        print("RULE-BASED IN SILICO MUTAGENESIS SCRIPT (WITH CLUSTERING)")
-        print("=" * 70)
-        print("\nDESCRIPTION:")
-        print("Performs rule-based mutagenesis on protein sequences.")
-        print("Rules apply ONLY when amino acids are clustered together.")
-        print("Multiple rules can apply simultaneously to the same motif.")
-        print("Motifs with multiple rule matches are flagged as aggregation hotspots.")
-        print("\n" + "=" * 70)
-        
-        print_usage_example()
-        
-        parser.print_help()
-        
-        print("\n" + "=" * 70)
-        print("RULE DETAILS AND AGGREGATION SCORES:")
-        print("=" * 70)
-        for rule_name, rule in RULES.items():
-            print(f"\n{rule_name}:")
-            print(f"  {rule['description']}")
-            if rule_name == 'hydrophobic_and_aromatic':
-                print(f"  Conditions:")
-                print(f"    1. At least 2 hydrophobic-aromatic adjacent pairs")
-                print(f"    2. OR 1 hydrophobic-aromatic pair + at least 1 hydrophobic within 3 positions")
-            else:
-                print(f"  Residues: {', '.join(sorted(rule['residues']))}")
-            print(f"  Min cluster size: {rule['min_cluster_size']}")
-            print(f"  Max gap: {rule['max_gap']} positions")
-            print(f"  Aggregation score: {rule['aggregation_score']}")
-        
-        print("\n" + "=" * 70)
-        print("OVERLAP HANDLING PROCEDURE:")
-        print("=" * 70)
-        print("Overlapping motifs are resolved by keeping the UNION of motif positions.")
-        print("Additionally, motifs within 2 positions of each other are also merged.")
-        print("When clusters overlap or are close (≤2 positions apart), the script will:")
-        print("1. Merge all overlapping clusters into a single unified cluster")
-        print("2. Merge clusters that are within 2 positions of each other")
-        print("3. Apply mutations to the unified motif")
-        print("This creates larger mutagenesis regions covering all adjacent risk areas.")
-        print("=" * 70)
-        
-        print("\n" + "=" * 70)
-        print("GATEKEEPING AMINO ACIDS:")
-        print("=" * 70)
-        print("Gatekeeping amino acids are only applied to positions at the edge of motifs")
-        print("or directly adjacent to region boundaries (within 1 position).")
-        print(f"Default gatekeeping amino acids: {GATEKEEPING_AAS}")
-        print("Use --gatekeeping option to specify custom gatekeeping amino acids.")
-        print("=" * 70)
-        
-        if not args.input_file:
-            print("\nERROR: Input FASTA file is required!")
-            sys.exit(1)
-        sys.exit(0)
+    print_usage_example()
+    parser.print_help()
     
+    print("\n" + "=" * 70)
+    print("RULE DETAILS AND AGGREGATION SCORES:")
+    print("=" * 70)
+    for rule_name, rule in RULES.items():
+        print(f"\n{rule_name}:")
+        print(f"  {rule['description']}")
+        if rule_name == 'hydrophobic_and_aromatic':
+            print(f"  Conditions:")
+            print(f"    1. At least 2 hydrophobic-aromatic adjacent pairs")
+            print(f"    2. OR 1 hydrophobic-aromatic pair + at least 1 hydrophobic within 3 positions")
+        else:
+            print(f"  Residues: {', '.join(sorted(rule['residues']))}")
+        print(f"  Min cluster size: {rule['min_cluster_size']}")
+        print(f"  Max gap: {rule['max_gap']} positions")
+        print(f"  Aggregation score: {rule['aggregation_score']}")
+    
+    print("\n" + "=" * 70)
+    print("OVERLAP HANDLING PROCEDURE:")
+    print("=" * 70)
+    print("Overlapping motifs are resolved by keeping the UNION of motif positions.")
+    print("Additionally, motifs within 2 positions of each other are also merged.")
+    print("When clusters overlap or are close (≤2 positions apart), the script will:")
+    print("1. Merge all overlapping clusters into a single unified cluster")
+    print("2. Merge clusters that are within 2 positions of each other")
+    print("3. Apply mutations to the unified motif")
+    print("This creates larger mutagenesis regions covering all adjacent risk areas.")
+    print("=" * 70)
+    
+    print("\n" + "=" * 70)
+    print("GATEKEEPING AMINO ACIDS:")
+    print("=" * 70)
+    print("Gatekeeping amino acids are only applied to positions at the edge of motifs")
+    print("or directly adjacent to region boundaries (within 1 position).")
+    print(f"Default gatekeeping amino acids: {GATEKEEPING_AAS}")
+    print("Use --gatekeeping option to specify custom gatekeeping amino acids.")
+    print("=" * 70)
+
+def validate_arguments(args) -> None:
+    """Validate command line arguments"""
     # Check if at least one type of mutation is requested
     if not args.agg_only and not args.positions and not args.regions and not args.insert_positions:
         print("\nERROR: You must specify at least one of:")
@@ -1077,24 +1348,127 @@ def main():
         sys.exit(1)
     
     # Validate mutation list
-    for aa in args.mutations:
-        if len(aa) != 1 or aa.upper() not in 'ACDEFGHIKLMNPQRSTVWY':
-            print(f"Error: '{aa}' is not a valid single-letter amino acid code", file=sys.stderr)
-            print("Valid amino acids: A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y")
-            sys.exit(1)
+    try:
+        validate_amino_acids(args.mutations, "mutation amino acids", strict=True)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     
     # Validate gatekeeping amino acids list
-    for aa in args.gatekeeping:
-        if len(aa) != 1 or aa.upper() not in 'ACDEFGHIKLMNPQRSTVWY':
-            print(f"Error: '{aa}' is not a valid single-letter amino acid code", file=sys.stderr)
-            print("Valid amino acids: A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y")
-            sys.exit(1)
+    try:
+        validate_amino_acids(args.gatekeeping, "gatekeeping amino acids", strict=True)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     
     # Validate that insert-positions and insert-aas are both provided or both omitted
     if bool(args.insert_positions) != bool(args.insert_aas):
         print("\nERROR: Both --insert-positions and --insert-aas must be provided together", file=sys.stderr)
         print("Example: --insert-positions 10 20 --insert-aas K M")
         sys.exit(1)
+
+def print_mutation_summary(mutations: List[Tuple[str, str]]):
+    """Print summary of generated mutations"""
+    if not mutations:
+        print("\nNo mutations generated. Check your criteria.")
+        return
+    
+    print(f"\n{'='*70}")
+    print("MUTATION SUMMARY (Sorted by aggregation score)")
+    print(f"{'='*70}")
+    
+    # First, extract aggregation scores and group mutations
+    mutation_data = []
+    for desc, seq in mutations:
+        # Extract agg_score from description
+        agg_score = 0
+        if "(agg_score=" in desc:
+            try:
+                agg_str = desc.split("(agg_score=")[1].split(")")[0]
+                agg_score = int(agg_str)
+            except (IndexError, ValueError):
+                agg_score = 0
+        mutation_data.append((desc, seq, agg_score))
+    
+    # Count by type using the new standardized headers
+    direct = sum(1 for d, _, _ in mutation_data if "Direct mutation" in d)
+    rule_based = sum(1 for d, _, _ in mutation_data if "Rule '" in d and "GATEKEEPING" not in d)
+    merged_rules = sum(1 for d, _, _ in mutation_data if "MERGED RULES" in d and "GATEKEEPING" not in d)
+    insertions = sum(1 for d, _, _ in mutation_data if "Insertion" in d)
+    gatekeeping = sum(1 for d, _, _ in mutation_data if "GATEKEEPING" in d)
+    
+    # Count specific rule types for detailed breakdown
+    hydrophobic = sum(1 for d, _, _ in mutation_data if "Rule 'hydrophobic_aliphatic'" in d and "GATEKEEPING" not in d)
+    aromatic = sum(1 for d, _, _ in mutation_data if "Rule 'aromatic'" in d and "GATEKEEPING" not in d)
+    amide = sum(1 for d, _, _ in mutation_data if "Rule 'amide'" in d and "GATEKEEPING" not in d)
+    hydrophobic_arom = sum(1 for d, _, _ in mutation_data if "Rule 'hydrophobic_and_aromatic'" in d and "GATEKEEPING" not in d)
+    
+    print(f"Direct mutations: {direct} (agg_score: 0)")
+    print(f"Rule-based mutations: {rule_based}")
+    print(f"  • Hydrophobic mutations: {hydrophobic} (agg_score: 3)")
+    print(f"  • Hydrophobic-aromatic mutations: {hydrophobic_arom} (agg_score: 2)")
+    print(f"  • Aromatic mutations: {aromatic} (agg_score: 2)")
+    print(f"  • Amide mutations: {amide} (agg_score: 1)")
+    print(f"Merged rule mutations: {merged_rules} (agg_score: 4-8)")
+    print(f"Insertions: {insertions} (agg_score: 0)")
+    print(f"Gatekeeping mutations: {gatekeeping}")
+    print(f"TOTAL: {len(mutations)}")
+    
+    # Show top 5 mutations by aggregation score
+    if mutation_data:
+        print(f"\nTOP 5 MUTATIONS BY AGGREGATION SCORE:")
+        for i, (desc, _, agg_score) in enumerate(mutation_data[:5], 1):
+            if len(desc) > 80:
+                desc = desc[:77] + "..."
+            print(f"{i}. {desc}")
+    
+    if hydrophobic_arom > 0:
+        print(f"\nHydrophobic-aromatic mutations found:")
+        for desc, _, _ in mutation_data:
+            if "Rule 'hydrophobic_and_aromatic'" in desc and "GATEKEEPING" not in desc:
+                if len(desc) > 80:
+                    desc = desc[:77] + "..."
+                print(f"  • {desc}")
+                break
+    
+    if gatekeeping > 0:
+        print(f"\nGatekeeping mutations (edge positions only):")
+        gatekeeping_shown = 0
+        for i, (desc, _, _) in enumerate(mutation_data):
+            if "GATEKEEPING" in desc:
+                if len(desc) > 80:
+                    desc = desc[:77] + "..."
+                print(f"  {gatekeeping_shown+1}. {desc}")
+                gatekeeping_shown += 1
+                if gatekeeping_shown >= 5:  # Show first 5 gatekeeping mutations
+                    if gatekeeping > 5:
+                        print(f"  ... and {gatekeeping - 5} more gatekeeping mutations")
+                    break
+    
+    print(f"\nAll mutations (first 10, sorted by agg_score):")
+    shown = 0
+    for i, (desc, _, agg_score) in enumerate(mutation_data):
+        print(f"{i+1}. {desc}")
+        shown += 1
+        if shown >= 10:
+            if len(mutation_data) > 10:
+                print(f"... and {len(mutation_data) - 10} more mutations")
+            break
+
+def main():
+    parser = setup_argument_parser()
+    args = parser.parse_args()
+    
+    # Show help if requested or no input file provided
+    if args.help or not args.input_file:
+        print_help_info(parser)
+        if not args.input_file:
+            print("\nERROR: Input FASTA file is required!")
+            sys.exit(1)
+        sys.exit(0)
+    
+    # Validate arguments
+    validate_arguments(args)
     
     try:
         # Read and validate input sequence
@@ -1145,6 +1519,9 @@ def main():
                 [aa.upper() for aa in args.gatekeeping],
                 args.verbose
             )
+            
+            # NOTE: mutations are now sorted by aggregation score (descending)
+            print(f"\n✓ Generated {len(mutations)} mutated sequences (sorted by aggregation score)")
         else:
             region_analyses = []
             mutations = []
@@ -1258,72 +1635,10 @@ def main():
                         print(f"  ... and {len(overlapping_clusters) - 3} more overlapping/close pairs")
         
         if not args.agg_only:
-            print(f"\n✓ Generated {len(mutations)} mutated sequences")
-            
             write_fasta(args.output, header, sequence, mutations, not args.no_original)
             print(f"✓ Results written to {args.output}")
             
-            if mutations:
-                print(f"\n{'='*70}")
-                print("MUTATION SUMMARY")
-                print(f"{'='*70}")
-                
-                # Count by type
-                direct = sum(1 for d, _ in mutations if "Direct" in d)
-                hydrophobic = sum(1 for d, _ in mutations if "hydrophobic_aliphatic" in d and "+" not in d and "GATEKEEPING" not in d)
-                aromatic = sum(1 for d, _ in mutations if "aromatic" in d and "hydrophobic_and_aromatic" not in d and "+" not in d and "GATEKEEPING" not in d)
-                amide = sum(1 for d, _ in mutations if "amide" in d and "+" not in d and "GATEKEEPING" not in d)
-                hydrophobic_arom = sum(1 for d, _ in mutations if "hydrophobic_and_aromatic" in d and "+" not in d and "GATEKEEPING" not in d)
-                merged_rules = sum(1 for d, _ in mutations if "MERGED RULES" in d and "GATEKEEPING" not in d)
-                multi_rule = sum(1 for d, _ in mutations if "MULTI-RULE" in d and "MERGED RULES" not in d and "GATEKEEPING" not in d)
-                insertions = sum(1 for d, _ in mutations if "Insertion" in d)
-                gatekeeping = sum(1 for d, _ in mutations if "GATEKEEPING" in d)
-                
-                print(f"Direct mutations: {direct}")
-                print(f"Hydrophobic mutations: {hydrophobic} (agg_score: 3)")
-                print(f"Hydrophobic-aromatic mutations: {hydrophobic_arom} (agg_score: 2)")
-                print(f"Aromatic mutations: {aromatic} (agg_score: 2)")
-                print(f"Amide mutations: {amide} (agg_score: 1)")
-                print(f"Merged rule mutations: {merged_rules}")
-                print(f"Multi-rule mutations: {multi_rule}")
-                print(f"Insertions: {insertions}")
-                print(f"Gatekeeping mutations: {gatekeeping}")
-                print(f"TOTAL: {len(mutations)}")
-                
-                if hydrophobic_arom > 0:
-                    print(f"\nSpecial hydrophobic-aromatic mutations found!")
-                    for desc, _ in mutations:
-                        if "hydrophobic_and_aromatic" in desc and "MERGED RULES" not in desc and "GATEKEEPING" not in desc:
-                            if len(desc) > 80:
-                                desc = desc[:77] + "..."
-                            print(f"  • {desc}")
-                            break
-                
-                if gatekeeping > 0:
-                    print(f"\nGatekeeping mutations (edge positions only):")
-                    gatekeeping_shown = 0
-                    for i, (desc, _) in enumerate(mutations):
-                        if "GATEKEEPING" in desc:
-                            if len(desc) > 80:
-                                desc = desc[:77] + "..."
-                            print(f"  {gatekeeping_shown+1}. {desc}")
-                            gatekeeping_shown += 1
-                            if gatekeeping_shown >= 5:  # Show first 5 gatekeeping mutations
-                                if gatekeeping > 5:
-                                    print(f"  ... and {gatekeeping - 5} more gatekeeping mutations")
-                                break
-                
-                print(f"\nAll mutations (first 10):")
-                shown = 0
-                for i, (desc, _) in enumerate(mutations):
-                    print(f"{i+1}. {desc}")
-                    shown += 1
-                    if shown >= 10:
-                        if len(mutations) > 10:
-                            print(f"... and {len(mutations) - 10} more mutations")
-                        break
-            else:
-                print("\nNo mutations generated. Check your criteria.")
+            print_mutation_summary(mutations)
         else:
             print(f"\n✓ Aggregation analysis completed")
         
